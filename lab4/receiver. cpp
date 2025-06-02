@@ -1,0 +1,92 @@
+#include <windows.h>
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <string>
+#include "shared.h"
+
+int main() {
+    std::string filename;
+    int maxMessages;
+
+    std::cout << "Введите имя файла: ";
+    std::cin >> filename;
+
+    std::cout << "Введите максимальное число сообщений: ";
+    std::cin >> maxMessages;
+
+    std::fstream file(filename, std::ios::binary | std::ios::in | std::ios::out | std::ios::trunc);
+    if (!file) {
+        std::cerr << "Ошибка открытия файла\n";
+        return 1;
+    }
+
+    SharedHeader header = {0, 0, maxMessages};
+    HANDLE mutex = CreateMutexA(NULL, FALSE, (filename + "_mutex").c_str());
+    file.write(reinterpret_cast<char*>(&header), sizeof(header));
+
+    Message empty = {};
+    for (int i = 0; i < maxMessages; ++i)
+        file.write(reinterpret_cast<char*>(&empty), sizeof(Message));
+    file.flush();
+
+    int senderCount;
+    std::cout << "Введите количество Sender-процессов: ";
+    std::cin >> senderCount;
+
+    std::vector<HANDLE> readyEvents;
+    for (int i = 0; i < senderCount; ++i) {
+        std::string eventName = "SenderReady_" + std::to_string(i);
+        HANDLE event = CreateEventA(NULL, TRUE, FALSE, eventName.c_str());
+        readyEvents.push_back(event);
+
+        std::string command = "sender.exe " + filename + " " + std::to_string(i);
+        STARTUPINFOA si = { sizeof(si) };
+        PROCESS_INFORMATION pi;
+        CreateProcessA(NULL, (LPSTR)command.c_str(), NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi);
+    }
+
+    std::cout << "Ожидание готовности Sender-процессов...\n";
+    WaitForMultipleObjects(senderCount, readyEvents.data(), TRUE, INFINITE);
+    std::cout << "Все Sender-процессы готовы.\n";
+
+    while (true) {
+        std::string command;
+        std::cout << "[Receiver] Команда (read/exit): ";
+        std::cin >> command;
+
+        if (command == "exit") break;
+        if (command != "read") continue;
+
+        file.seekg(0);
+        file.read(reinterpret_cast<char*>(&header), sizeof(header));
+
+        WaitForSingleObject(mutex, INFINITE);
+
+        file.seekg(sizeof(SharedHeader) + header.readIndex * sizeof(Message));
+        Message msg;
+        file.read(reinterpret_cast<char*>(&msg), sizeof(Message));
+
+        if (strlen(msg.text) == 0) {
+            ReleaseMutex(mutex);
+            std::cout << "[Receiver] Нет новых сообщений. Ожидание...\n";
+            Sleep(1000);
+            continue;
+        }
+
+        std::cout << "[Receiver] Получено сообщение: " << msg.text << "\n";
+
+        Message empty = {};
+        file.seekp(sizeof(SharedHeader) + header.readIndex * sizeof(Message));
+        file.write(reinterpret_cast<char*>(&empty), sizeof(Message));
+
+        header.readIndex = (header.readIndex + 1) % header.maxMessages;
+        file.seekp(0);
+        file.write(reinterpret_cast<char*>(&header), sizeof(header));
+        file.flush();
+
+        ReleaseMutex(mutex);
+    }
+
+    return 0;
+}
